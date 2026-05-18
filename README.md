@@ -38,12 +38,24 @@ GTK4 + libadwaita, touch-friendly UI, single-file Python.
 
 ## Install
 
+**One-liner (recommended):**
+
+```
+curl -fsSL https://raw.githubusercontent.com/the-priest/netstrike/main/get.sh | sudo bash
+```
+
+Pulls the repo, installs all apt deps (gtk4, libadwaita, aircrack-ng, nmap, iw,
+policykit), drops the binary into `/usr/local/bin`, registers the icon and
+desktop entry.
+
+**Manual (from a local clone):**
+
 ```
 chmod +x install.sh
 sudo ./install.sh
 ```
 
-Then launch *NetStrike* from the app drawer, or:
+Launch *NetStrike* from the app drawer, or:
 
 ```
 pkexec /usr/local/bin/netstrike

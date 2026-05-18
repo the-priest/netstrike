@@ -1,21 +1,54 @@
-MIT License
+#!/bin/bash
+# NetStrike installer
+# Installs all dependencies, the binary, icon, and desktop entry.
+set -e
 
-Copyright (c) 2026 The Priest
+if [ "$(id -u)" -ne 0 ]; then
+    echo "[!] Run as root: sudo ./install.sh"
+    exit 1
+fi
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+APT_PKGS="python3 python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 \
+aircrack-ng nmap iw policykit-1 \
+hicolor-icon-theme desktop-file-utils"
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+if ! command -v apt-get >/dev/null 2>&1; then
+    echo "[!] This installer assumes a Debian/Kali system with apt."
+    echo "    Install manually: $APT_PKGS"
+    exit 1
+fi
+
+echo "[*] Updating package lists..."
+DEBIAN_FRONTEND=noninteractive apt-get update -qq
+
+echo "[*] Installing dependencies..."
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $APT_PKGS
+
+# Verify Python bindings actually work after install
+if ! python3 -c "import gi; gi.require_version('Gtk','4.0'); gi.require_version('Adw','1'); from gi.repository import Gtk, Adw" 2>/dev/null; then
+    echo "[!] Python GTK4/libadwaita bindings still not importable after install."
+    echo "    Check: python3-gi, gir1.2-gtk-4.0, gir1.2-adw-1"
+    exit 1
+fi
+
+echo "[*] Installing binary -> /usr/local/bin/netstrike"
+install -m 755 "$SCRIPT_DIR/netstrike.py" /usr/local/bin/netstrike
+
+echo "[*] Installing icon -> /usr/share/icons/hicolor/scalable/apps/"
+install -D -m 644 "$SCRIPT_DIR/netstrike.svg" \
+    /usr/share/icons/hicolor/scalable/apps/netstrike.svg
+
+echo "[*] Installing desktop entry -> /usr/share/applications/"
+install -m 644 "$SCRIPT_DIR/netstrike.desktop" \
+    /usr/share/applications/netstrike.desktop
+
+echo "[*] Refreshing caches..."
+gtk-update-icon-cache -f /usr/share/icons/hicolor 2>/dev/null || true
+update-desktop-database /usr/share/applications 2>/dev/null || true
+
+echo
+echo "[+] Installed."
+echo "    Launch from the app drawer, or run: pkexec /usr/local/bin/netstrike"
+echo "    Activity log: ~/.config/netstrike/activity.log"
