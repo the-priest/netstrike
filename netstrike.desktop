@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=NetStrike
+GenericName=WiFi Audit Tool
+Comment=WiFi security audit and network reconnaissance
+Exec=pkexec /usr/local/bin/netstrike
+Icon=netstrike
+Terminal=false
+Categories=Network;Security;System;
+Keywords=wifi;wireless;security;audit;nmap;deauth;
+StartupNotify=true
