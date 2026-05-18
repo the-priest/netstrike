@@ -1,0 +1,18 @@
+#!/bin/bash
+# NetStrike GUI launcher
+# pkexec strips environment variables for security. GUI apps that need to
+# reach the Wayland compositor (Phosh, GNOME, KDE, ...) will crash without
+# WAYLAND_DISPLAY / XDG_RUNTIME_DIR / etc. This wrapper passes them through.
+
+exec pkexec env \
+    DISPLAY="${DISPLAY:-}" \
+    WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" \
+    XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
+    XDG_DATA_DIRS="${XDG_DATA_DIRS:-/usr/local/share:/usr/share}" \
+    XDG_CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP:-}" \
+    XDG_SESSION_TYPE="${XDG_SESSION_TYPE:-}" \
+    DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}" \
+    XAUTHORITY="${XAUTHORITY:-}" \
+    GDK_BACKEND="${GDK_BACKEND:-}" \
+    GTK_THEME="${GTK_THEME:-}" \
+    /usr/local/bin/netstrike "$@"

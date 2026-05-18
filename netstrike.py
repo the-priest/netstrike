@@ -575,10 +575,21 @@ class NetStrikeApp(Adw.Application):
         self.connect('activate', self.on_activate)
 
     def on_activate(self, app):
+        display = Gdk.Display.get_default()
+        if display is None:
+            sys.stderr.write(
+                "ERROR: No display connection.\n"
+                "Wayland/X11 env vars aren't reaching this process.\n"
+                "Launch via the .desktop entry, or run:\n"
+                "  sudo -E netstrike\n"
+                "Required env: WAYLAND_DISPLAY, XDG_RUNTIME_DIR (and DISPLAY on X11)\n"
+            )
+            sys.exit(1)
+
         css = Gtk.CssProvider()
         css.load_from_data(CSS_STYLES)
         Gtk.StyleContext.add_provider_for_display(
-            Gdk.Display.get_default(),
+            display,
             css,
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
         )
