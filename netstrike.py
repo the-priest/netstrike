@@ -6,6 +6,9 @@ For NetHunter Pro / Phosh / Mobile Linux
 Use only on networks you own or have explicit authorization to test.
 
 Changelog vs v1.0:
+- v1.2: Test Injection button in Tools tab (runs `aireplay-ng --test`).
+  Underlying deauth cap tightened from 10000 -> 500 frames.
+- v1.1:
 - Monitor-mode check now gates ALL destructive actions (deauth/broadcast/capture)
 - aireplay-ng output parsed for real errors instead of trusting exit code
 - WiFi scan auto-brings interface up; detects monitor-mode block and offers
@@ -472,8 +475,8 @@ class DeauthManager:
             return False, str(e)
 
     def deauth_client(self, ap_bssid, client_mac, channel, count=64):
-        if count <= 0 or count > 10000:
-            return False, "Packet count must be between 1 and 10000"
+        if count <= 0 or count > 500:
+            return False, "Packet count must be between 1 and 500"
         self._set_channel_if_monitor(channel)
         cmd = ['aireplay-ng', '--ignore-negative-one',
                '--deauth', str(count),
@@ -481,13 +484,27 @@ class DeauthManager:
         return self._run_aireplay(cmd)
 
     def deauth_broadcast(self, ap_bssid, channel, count=64):
-        if count <= 0 or count > 10000:
-            return False, "Packet count must be between 1 and 10000"
+        if count <= 0 or count > 2000:
+            return False, "Packet count must be between 1 and 2000"
         self._set_channel_if_monitor(channel)
         cmd = ['aireplay-ng', '--ignore-negative-one',
                '--deauth', str(count),
                '-a', ap_bssid, self.interface]
         return self._run_aireplay(cmd)
+
+    def test_injection(self):
+        """Run aireplay-ng --test to verify the radio can actually inject."""
+        try:
+            result = subprocess.run(
+                ['aireplay-ng', '--test', self.interface],
+                capture_output=True, text=True, timeout=25)
+            return True, (result.stdout or '') + (result.stderr or '')
+        except subprocess.TimeoutExpired:
+            return False, "Test timed out"
+        except FileNotFoundError:
+            return False, "aireplay-ng not installed"
+        except Exception as e:
+            return False, str(e)
 
     def capture_handshake(self, ap_bssid, ssid, client_mac, channel):
         """Capture WPA handshake to ~/Documents/netstrike/captures/
@@ -1327,6 +1344,23 @@ class MainWindow(Adw.ApplicationWindow):
         mode_card.append(btn_row)
         content.append(mode_card)
 
+        # Diagnostics card
+        diag_card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        diag_card.add_css_class("card")
+        diag_card.append(self._label("Diagnostics", "title-label"))
+        diag_card.append(self._label(
+            "Verify the interface can actually inject frames. Sends test packets "
+            "to nearby APs and counts responses. Run this first when deauth "
+            "appears to do nothing — it's almost always a radio/driver issue or "
+            "PMF on the target, not a packet-count issue.",
+            "subtitle-label"))
+
+        test_btn = Gtk.Button(label="🧪 Test Injection")
+        test_btn.add_css_class("action-button")
+        test_btn.connect("clicked", self.on_test_injection)
+        diag_card.append(test_btn)
+        content.append(diag_card)
+
         # Info card
         info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         info.add_css_class("card")
@@ -1396,6 +1430,45 @@ class MainWindow(Adw.ApplicationWindow):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def on_test_injection(self, btn):
+        mode = get_interface_mode(self.current_iface)
+        if mode != 'monitor':
+            self._error(
+                "Monitor mode required",
+                f"{self.current_iface} is in '{mode}' mode. "
+                f"Injection self-test only works in monitor mode."
+            )
+            return
+
+        btn.set_sensitive(False)
+        self.set_status("Testing injection…")
+        write_log(f"Injection test on {self.current_iface}")
+
+        def worker():
+            ok, output = self.deauth.test_injection()
+            def show():
+                btn.set_sensitive(True)
+                self.set_status("Ready")
+                body = output[:1800] if output else "No output from aireplay-ng"
+                dlg = Adw.MessageDialog(
+                    transient_for=self,
+                    heading=f"Injection test: {self.current_iface}",
+                    body=body)
+                dlg.add_response("ok", "OK")
+                dlg.present()
+                low = output.lower()
+                if 'injection is working' in low:
+                    self.toast("✓ Injection working")
+                    write_log("Injection test: OK")
+                elif '0/30' in output or 'no answer' in low:
+                    self.toast("✗ Injection NOT working — radio/driver issue",
+                               timeout=6)
+                    write_log("Injection test: FAILED (no responses)")
+                else:
+                    self.toast("Test complete — see dialog", timeout=4)
+            GLib.idle_add(show)
+        threading.Thread(target=worker, daemon=True).start()
+
     def _error(self, heading, body):
         d = Adw.MessageDialog(transient_for=self, heading=heading, body=body)
         d.add_response("ok", "OK")
@@ -1407,7 +1480,7 @@ class MainWindow(Adw.ApplicationWindow):
 # ============================================================================
 
 def main():
-    write_log("NetStrike v1.1 started")
+    write_log("NetStrike v1.2 started")
     app = NetStrikeApp()
     return app.run(sys.argv)
 
