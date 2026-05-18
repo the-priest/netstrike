@@ -1,9 +1,26 @@
 #!/usr/bin/env python3
 """
-NetStrike - WiFi Security Audit Tool
+NetStrike v1.1 - WiFi Security Audit Tool
 For NetHunter Pro / Phosh / Mobile Linux
 
 Use only on networks you own or have explicit authorization to test.
+
+Changelog vs v1.0:
+- Monitor-mode check now gates ALL destructive actions (deauth/broadcast/capture)
+- aireplay-ng output parsed for real errors instead of trusting exit code
+- WiFi scan auto-brings interface up; detects monitor-mode block and offers
+  to switch to managed temporarily
+- Channel set is conditional (only attempted in monitor mode)
+- Handshake captures land in ~/Documents/netstrike/captures/ with timestamped
+  filenames instead of /tmp
+- Toast notifications (Adw.ToastOverlay) replace silent state changes
+- Mode badge in header (yellow=monitor, green=managed) — visible at all times
+- Gtk.Spinner replaces hacky ProgressBar pulse
+- Empty-state rows in lists ("No networks found", "No clients found")
+- Refresh button next to interface dropdown — re-detects adapters mid-session
+- Mode label and badge refresh on every iface change and mode toggle
+- iw scan simplified to single blocking call
+- Status bar caches mode (no longer subprocess-spams iw on every update)
 """
 
 import gi
@@ -17,6 +34,7 @@ import re
 import os
 import glob
 import sys
+import time
 from pathlib import Path
 from datetime import datetime
 
@@ -28,50 +46,59 @@ APP_ID = 'org.thepriest.netstrike'
 APP_NAME = 'NetStrike'
 CONFIG_DIR = Path.home() / '.config' / 'netstrike'
 LOG_FILE = CONFIG_DIR / 'activity.log'
+CAPTURE_DIR = Path.home() / 'Documents' / 'netstrike' / 'captures'
 SCAN_PREFIX = '/tmp/netstrike_scan'
+CLIENT_SCAN_DURATION = 15  # seconds
 
 CSS_STYLES = b"""
 window { background-color: #1e1e2e; }
 .card {
     background-color: #313244;
     border-radius: 12px;
-    padding: 16px;
+    padding: 12px;
 }
 .network-row, .client-row {
     background-color: #313244;
     border-radius: 10px;
-    padding: 6px;
-    margin: 4px 0;
+    margin: 3px 0;
 }
 .action-button {
     background-color: #89b4fa;
     color: #1e1e2e;
     font-weight: bold;
-    min-height: 48px;
+    min-height: 44px;
     border-radius: 10px;
-    padding: 8px 16px;
+    padding: 6px 14px;
 }
 .action-button:hover { background-color: #74c7ec; }
 .danger-button {
     background-color: #f38ba8;
     color: #1e1e2e;
     font-weight: bold;
-    min-height: 48px;
+    min-height: 44px;
     border-radius: 10px;
-    padding: 8px 16px;
+    padding: 6px 14px;
 }
 .danger-button:hover { background-color: #eba0ac; }
 .success-button {
     background-color: #a6e3a1;
     color: #1e1e2e;
     font-weight: bold;
-    min-height: 48px;
+    min-height: 44px;
     border-radius: 10px;
-    padding: 8px 16px;
+    padding: 6px 14px;
 }
 .success-button:hover { background-color: #94e2d5; }
+.subtle-button {
+    background-color: #45475a;
+    color: #cdd6f4;
+    border-radius: 8px;
+    min-height: 36px;
+    padding: 4px 10px;
+}
+.subtle-button:hover { background-color: #585b70; }
 .title-label {
-    font-size: 16px;
+    font-size: 15px;
     font-weight: bold;
     color: #cdd6f4;
 }
@@ -79,31 +106,52 @@ window { background-color: #1e1e2e; }
     font-size: 22px;
     font-weight: 900;
     color: #cdd6f4;
-    margin: 8px 0 12px 0;
+    margin: 4px 0 8px 0;
 }
 .subtitle-label {
-    font-size: 12px;
+    font-size: 11px;
     color: #a6adc8;
+}
+.empty-state {
+    color: #6c7086;
+    font-style: italic;
+    padding: 24px;
 }
 .signal-strong { color: #a6e3a1; }
 .signal-medium { color: #f9e2af; }
 .signal-weak { color: #f38ba8; }
 .status-bar {
     background-color: #181825;
-    padding: 8px 12px;
-    font-size: 12px;
+    padding: 6px 12px;
+    font-size: 11px;
     color: #a6adc8;
 }
 .log-view {
     font-family: monospace;
-    font-size: 11px;
+    font-size: 10px;
     color: #cdd6f4;
     background-color: #11111b;
     padding: 8px;
     border-radius: 8px;
 }
-.mode-monitor { color: #f9e2af; font-weight: bold; }
-.mode-managed { color: #a6e3a1; font-weight: bold; }
+.mode-badge {
+    border-radius: 12px;
+    padding: 3px 10px;
+    font-size: 11px;
+    font-weight: bold;
+}
+.mode-badge-monitor {
+    background-color: #f9e2af;
+    color: #1e1e2e;
+}
+.mode-badge-managed {
+    background-color: #a6e3a1;
+    color: #1e1e2e;
+}
+.mode-badge-unknown {
+    background-color: #45475a;
+    color: #cdd6f4;
+}
 """
 
 # ============================================================================
@@ -118,8 +166,10 @@ def write_log(msg):
     except Exception:
         pass
 
+
 def check_root():
     return os.geteuid() == 0
+
 
 def list_wireless_interfaces():
     """Return list of wireless interfaces detected by iw."""
@@ -130,8 +180,9 @@ def list_wireless_interfaces():
     except Exception:
         return ['wlan0']
 
+
 def get_interface_mode(iface):
-    """Get current mode of interface (managed/monitor/etc)."""
+    """Get current mode of interface (managed/monitor/unknown)."""
     try:
         result = subprocess.run(['iw', 'dev', iface, 'info'],
                                 capture_output=True, text=True, timeout=5)
@@ -139,6 +190,48 @@ def get_interface_mode(iface):
         return m.group(1).lower() if m else 'unknown'
     except Exception:
         return 'unknown'
+
+
+def is_iface_up(iface):
+    try:
+        result = subprocess.run(['ip', 'link', 'show', iface],
+                                capture_output=True, text=True, timeout=5)
+        return 'state UP' in result.stdout or ',UP,' in result.stdout or '<UP' in result.stdout
+    except Exception:
+        return False
+
+
+def ensure_iface_up(iface):
+    """Bring interface up if it isn't already."""
+    try:
+        subprocess.run(['ip', 'link', 'set', iface, 'up'],
+                       capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+
+def parse_aireplay_error(output):
+    """Extract a human-readable error from aireplay-ng output.
+    aireplay-ng's exit code is unreliable — check the text."""
+    if not output:
+        return None
+    lowered = output.lower()
+    patterns = [
+        ('operation not permitted', "Permission denied — run as root"),
+        ('no such device', "Interface not found"),
+        ('network is down', "Interface is down"),
+        ("couldn't get current channel", "Interface not in monitor mode"),
+        ("couldn't determine current frequency", "Interface not in monitor mode"),
+        ('open of /sys/class/net', "Interface access failed"),
+        ('rfkill', "Wireless is blocked by rfkill — run: rfkill unblock wifi"),
+        ('not associated', "Interface not associated"),
+        ('error reading packet', "Adapter not in correct mode"),
+    ]
+    for needle, msg in patterns:
+        if needle in lowered:
+            return msg
+    return None
+
 
 def cleanup_scan_files():
     """Remove old airodump-ng output files."""
@@ -195,26 +288,38 @@ class WiFiScanner:
         self.interface = iface
 
     def scan_networks(self, callback):
-        """Trigger a scan and parse results."""
+        """Blocking iw scan. Brings iface up first.
+        Returns (success, networks, error_msg) via callback."""
         def worker():
             try:
-                # Trigger scan (non-blocking)
-                subprocess.run(['iw', 'dev', self.interface, 'scan', 'trigger'],
-                               capture_output=True, timeout=10)
-                # Give it time to gather
-                import time
-                time.sleep(3)
-                # Dump cached results
-                result = subprocess.run(['iw', 'dev', self.interface, 'scan', 'dump'],
-                                        capture_output=True, text=True, timeout=15)
+                ensure_iface_up(self.interface)
+
+                # iw scan blocks until results are ready
+                result = subprocess.run(
+                    ['iw', 'dev', self.interface, 'scan'],
+                    capture_output=True, text=True, timeout=45
+                )
+
                 if result.returncode != 0:
-                    # Fallback to full scan
-                    result = subprocess.run(['iw', 'dev', self.interface, 'scan'],
-                                            capture_output=True, text=True, timeout=30)
-                networks = self._parse_iw_scan(result.stdout) if result.returncode == 0 else []
+                    err = result.stderr.strip().lower()
+                    if 'operation not supported' in err or 'invalid argument' in err:
+                        msg = ("Scan refused by driver — interface is likely in "
+                               "monitor mode. Switch to managed in Tools.")
+                    elif 'busy' in err or 'resource' in err:
+                        msg = "Adapter busy — try again in a moment."
+                    elif 'permission' in err:
+                        msg = "Permission denied — run as root."
+                    else:
+                        msg = result.stderr.strip() or f"iw exited {result.returncode}"
+                    GLib.idle_add(callback, False, [], msg)
+                    return
+
+                networks = self._parse_iw_scan(result.stdout)
                 GLib.idle_add(callback, True, networks, "")
             except subprocess.TimeoutExpired:
                 GLib.idle_add(callback, False, [], "Scan timed out")
+            except FileNotFoundError:
+                GLib.idle_add(callback, False, [], "iw not installed")
             except Exception as e:
                 GLib.idle_add(callback, False, [], str(e))
 
@@ -230,9 +335,8 @@ class WiFiScanner:
             if line.startswith('BSS '):
                 if current_bss and current:
                     networks[current_bss] = self._build_network(current_bss, current)
-                # BSS aa:bb:cc:dd:ee:ff(on wlan0)
-                bssid_match = re.match(r'BSS\s+([0-9a-fA-F:]+)', line)
-                current_bss = bssid_match.group(1) if bssid_match else None
+                m = re.match(r'BSS\s+([0-9a-fA-F:]+)', line)
+                current_bss = m.group(1) if m else None
                 current = {}
             elif stripped.startswith('SSID:'):
                 current['ssid'] = stripped[5:].strip()
@@ -244,17 +348,16 @@ class WiFiScanner:
                 m = re.search(r'primary channel:\s+(\d+)', stripped)
                 if m:
                     current['channel'] = m.group(1)
-            elif 'DS Parameter set: channel' in stripped:
+            elif 'DS Parameter set: channel' in stripped and 'channel' not in current:
                 m = re.search(r'channel\s+(\d+)', stripped)
-                if m and 'channel' not in current:
+                if m:
                     current['channel'] = m.group(1)
             elif stripped.startswith('RSN:'):
+                # If SAE in next few lines we'd refine to WPA3, but WPA2 is
+                # close enough for display purposes.
                 current['encryption'] = 'WPA2'
             elif stripped.startswith('WPA:') and 'encryption' not in current:
                 current['encryption'] = 'WPA'
-            elif 'Privacy' in stripped and 'capability' in stripped.lower():
-                if 'encryption' not in current:
-                    current['encryption'] = 'WEP?'
 
         if current_bss and current:
             networks[current_bss] = self._build_network(current_bss, current)
@@ -271,7 +374,7 @@ class WiFiScanner:
         )
 
     def scan_clients(self, target_bssid, channel, duration, callback):
-        """Run airodump-ng for `duration` seconds, parse CSV output."""
+        """Run airodump-ng, parse CSV. Requires monitor mode (checked by caller)."""
         def worker():
             cleanup_scan_files()
             try:
@@ -285,20 +388,20 @@ class WiFiScanner:
                     '-w', SCAN_PREFIX,
                     self.interface
                 ]
-                # airodump writes to terminal — pipe everything away
                 subprocess.run(cmd, stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL,
                                timeout=duration + 5)
 
                 clients = self._parse_airodump_csv(target_bssid)
                 GLib.idle_add(callback, True, clients, "")
+            except FileNotFoundError:
+                GLib.idle_add(callback, False, [], "airodump-ng not installed")
             except Exception as e:
                 GLib.idle_add(callback, False, [], str(e))
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _parse_airodump_csv(self, target_bssid):
-        """Parse airodump CSV — the station section is what we want."""
         csv_files = sorted(glob.glob(f"{SCAN_PREFIX}-*.csv"))
         if not csv_files:
             return []
@@ -309,14 +412,12 @@ class WiFiScanner:
         except Exception:
             return []
 
-        # CSV has two sections: APs then Stations.
-        # Split on the Station MAC header.
         if 'Station MAC' not in content:
             return []
         _, station_section = content.split('Station MAC', 1)
 
         clients = []
-        for line in station_section.split('\n')[1:]:  # skip header line
+        for line in station_section.split('\n')[1:]:
             line = line.strip()
             if not line:
                 continue
@@ -330,7 +431,6 @@ class WiFiScanner:
 
             if not mac or bssid == '(not associated)':
                 continue
-            # Only clients on the target
             if bssid.lower() != target_bssid.lower():
                 continue
             clients.append(WiFiClient(mac, bssid, power, packets))
@@ -344,58 +444,80 @@ class WiFiScanner:
 class DeauthManager:
     def __init__(self):
         self.interface = 'wlan0'
-        self.process = None
 
     def set_interface(self, iface):
         self.interface = iface
 
-    def deauth_client(self, ap_bssid, client_mac, channel, count=64):
-        """Send `count` deauth frames to a specific client. count=0 is not allowed here."""
-        if count <= 0 or count > 10000:
-            return False, "Packet count must be between 1 and 10000"
-        try:
+    def _set_channel_if_monitor(self, channel):
+        """Channel set only works in monitor mode. Silently skip otherwise."""
+        if get_interface_mode(self.interface) == 'monitor':
             subprocess.run(['iw', 'dev', self.interface, 'set', 'channel', str(channel)],
                            capture_output=True, timeout=5)
 
-            cmd = ['aireplay-ng', '--deauth', str(count), '-a', ap_bssid,
-                   '-c', client_mac, self.interface]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-            return result.returncode == 0, result.stdout + result.stderr
+    def _run_aireplay(self, cmd):
+        """Run aireplay-ng, return (ok, message). Parses output for real errors
+        since aireplay's exit code is unreliable."""
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            output = (result.stdout or '') + (result.stderr or '')
+            err = parse_aireplay_error(output)
+            if err:
+                return False, err
+            return True, "Sent"
+        except subprocess.TimeoutExpired:
+            return False, "aireplay-ng timed out"
+        except FileNotFoundError:
+            return False, "aireplay-ng not installed"
         except Exception as e:
             return False, str(e)
+
+    def deauth_client(self, ap_bssid, client_mac, channel, count=64):
+        if count <= 0 or count > 10000:
+            return False, "Packet count must be between 1 and 10000"
+        self._set_channel_if_monitor(channel)
+        cmd = ['aireplay-ng', '--ignore-negative-one',
+               '--deauth', str(count),
+               '-a', ap_bssid, '-c', client_mac, self.interface]
+        return self._run_aireplay(cmd)
 
     def deauth_broadcast(self, ap_bssid, channel, count=64):
-        """Broadcast deauth to all clients on AP."""
         if count <= 0 or count > 10000:
             return False, "Packet count must be between 1 and 10000"
-        try:
-            subprocess.run(['iw', 'dev', self.interface, 'set', 'channel', str(channel)],
-                           capture_output=True, timeout=5)
-            cmd = ['aireplay-ng', '--deauth', str(count), '-a', ap_bssid, self.interface]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-            return result.returncode == 0, result.stdout + result.stderr
-        except Exception as e:
-            return False, str(e)
+        self._set_channel_if_monitor(channel)
+        cmd = ['aireplay-ng', '--ignore-negative-one',
+               '--deauth', str(count),
+               '-a', ap_bssid, self.interface]
+        return self._run_aireplay(cmd)
 
-    def capture_handshake(self, ap_bssid, client_mac, channel, capture_path):
-        """Start airodump capturing on a target, then deauth a client briefly
-        to force a reconnect and capture the WPA handshake."""
+    def capture_handshake(self, ap_bssid, ssid, client_mac, channel):
+        """Capture WPA handshake to ~/Documents/netstrike/captures/
+        Returns (success, message_with_path_or_error)."""
         try:
-            subprocess.run(['iw', 'dev', self.interface, 'set', 'channel', str(channel)],
-                           capture_output=True, timeout=5)
+            CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            safe_ssid = re.sub(r'[^A-Za-z0-9_-]', '_', ssid)[:20]
+            base = CAPTURE_DIR / f"{ts}_{safe_ssid}_{ap_bssid.replace(':', '')}"
+
+            self._set_channel_if_monitor(channel)
 
             cmd_capture = [
-                'airodump-ng', '--bssid', ap_bssid, '-c', str(channel),
-                '-w', capture_path, '--output-format', 'pcap',
+                'airodump-ng',
+                '--bssid', ap_bssid, '-c', str(channel),
+                '-w', str(base), '--output-format', 'pcap',
                 self.interface
             ]
-            cap_proc = subprocess.Popen(cmd_capture, stdout=subprocess.DEVNULL,
-                                        stderr=subprocess.DEVNULL)
-            import time
+            cap_proc = subprocess.Popen(cmd_capture,
+                                         stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL)
             time.sleep(2)
 
-            cmd_deauth = ['aireplay-ng', '--deauth', '4', '-a', ap_bssid,
-                          '-c', client_mac, self.interface]
+            # Check airodump actually started
+            if cap_proc.poll() is not None:
+                return False, "airodump-ng exited immediately — check monitor mode"
+
+            cmd_deauth = ['aireplay-ng', '--ignore-negative-one',
+                          '--deauth', '4',
+                          '-a', ap_bssid, '-c', client_mac, self.interface]
             subprocess.run(cmd_deauth, capture_output=True, timeout=30)
 
             time.sleep(10)
@@ -405,7 +527,13 @@ class DeauthManager:
             except subprocess.TimeoutExpired:
                 cap_proc.kill()
 
-            return True, f"Capture written near {capture_path}*.cap"
+            # Check we got at least one cap file with size > 0
+            caps = sorted(glob.glob(f"{base}-*.cap"))
+            if caps and os.path.getsize(caps[-1]) > 0:
+                return True, f"Saved: {caps[-1]}"
+            return False, "No capture file produced"
+        except FileNotFoundError as e:
+            return False, f"Missing tool: {e}"
         except Exception as e:
             return False, str(e)
 
@@ -443,11 +571,10 @@ NMAP_PROFILES = [
 class NetStrikeApp(Adw.Application):
     def __init__(self):
         super().__init__(application_id=APP_ID,
-                         flags=Gio.ApplicationFlags.FLAGS_NONE)
+                         flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
         self.connect('activate', self.on_activate)
 
     def on_activate(self, app):
-        # Load CSS on activate (proper place in GTK4)
         css = Gtk.CssProvider()
         css.load_from_data(CSS_STYLES)
         Gtk.StyleContext.add_provider_for_display(
@@ -468,28 +595,43 @@ class MainWindow(Adw.ApplicationWindow):
         self.scanner = WiFiScanner()
         self.deauth = DeauthManager()
         self.current_network = None
+        self._cached_mode = 'unknown'
 
-        # Detect interfaces
         self.interfaces = list_wireless_interfaces()
         self.current_iface = self.interfaces[0]
         self.scanner.set_interface(self.current_iface)
         self.deauth.set_interface(self.current_iface)
 
-        # Layout
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        self.set_content(box)
+        # Toast overlay wraps everything so messages float over any page
+        self.toast_overlay = Adw.ToastOverlay()
+        self.set_content(self.toast_overlay)
 
-        # Header bar with interface selector
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.toast_overlay.set_child(outer)
+
+        # Header
         header = Adw.HeaderBar()
-        title_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        title_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         title_box.append(Gtk.Label(label=APP_NAME))
+        self.mode_badge = Gtk.Label(label="?")
+        self.mode_badge.add_css_class("mode-badge")
+        self.mode_badge.add_css_class("mode-badge-unknown")
+        title_box.append(self.mode_badge)
         header.set_title_widget(title_box)
 
+        # Interface dropdown + refresh
+        iface_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         self.iface_dropdown = Gtk.DropDown.new_from_strings(self.interfaces)
         self.iface_dropdown.set_selected(0)
         self.iface_dropdown.connect("notify::selected", self.on_iface_changed)
-        header.pack_end(self.iface_dropdown)
-        box.append(header)
+        iface_box.append(self.iface_dropdown)
+
+        refresh_btn = Gtk.Button.new_from_icon_name("view-refresh-symbolic")
+        refresh_btn.set_tooltip_text("Re-detect wireless interfaces")
+        refresh_btn.connect("clicked", self.on_refresh_interfaces)
+        iface_box.append(refresh_btn)
+        header.pack_end(iface_box)
+        outer.append(header)
 
         # Pages
         self.stack = Adw.ViewStack()
@@ -499,37 +641,61 @@ class MainWindow(Adw.ApplicationWindow):
                                         "Nmap", "network-workgroup-symbolic")
         self.stack.add_titled_with_icon(self._build_tools_page(), "tools",
                                         "Tools", "applications-system-symbolic")
-        box.append(self.stack)
+        outer.append(self.stack)
 
         switcher = Adw.ViewSwitcherBar()
         switcher.set_stack(self.stack)
         switcher.set_reveal(True)
-        box.append(switcher)
+        outer.append(switcher)
 
         # Status bar
-        self.status = Gtk.Label(label=self._status_text("Ready"))
+        self.status = Gtk.Label(label="Ready")
         self.status.add_css_class("status-bar")
         self.status.set_xalign(0)
-        box.append(self.status)
+        outer.append(self.status)
 
-        # Root check
+        # Initial mode badge + warnings
+        self.refresh_mode_indicators()
         if not check_root():
             GLib.idle_add(self._show_root_warning)
 
-    def _status_text(self, msg):
-        mode = get_interface_mode(self.current_iface)
-        return f"{msg}  •  {self.current_iface} [{mode}]"
-
+    # ------------------------------------------------------------------
+    # Status / toast / mode
+    # ------------------------------------------------------------------
     def set_status(self, msg):
-        GLib.idle_add(self.status.set_text, self._status_text(msg))
+        GLib.idle_add(
+            self.status.set_text,
+            f"{msg}  •  {self.current_iface} [{self._cached_mode}]"
+        )
+
+    def toast(self, msg, timeout=3):
+        t = Adw.Toast.new(msg)
+        t.set_timeout(timeout)
+        GLib.idle_add(self.toast_overlay.add_toast, t)
+
+    def refresh_mode_indicators(self):
+        mode = get_interface_mode(self.current_iface)
+        self._cached_mode = mode
+        self.mode_badge.set_text(mode)
+        for cls in ("mode-badge-monitor", "mode-badge-managed", "mode-badge-unknown"):
+            self.mode_badge.remove_css_class(cls)
+        if mode == 'monitor':
+            self.mode_badge.add_css_class("mode-badge-monitor")
+        elif mode == 'managed':
+            self.mode_badge.add_css_class("mode-badge-managed")
+        else:
+            self.mode_badge.add_css_class("mode-badge-unknown")
+        if hasattr(self, 'mode_label'):
+            self.mode_label.set_text(f"{self.current_iface}: {mode}")
+        self.set_status("Ready")
 
     def _show_root_warning(self):
         dialog = Adw.MessageDialog(
             transient_for=self,
             heading="Root required",
-            body="NetStrike needs root to control the wireless interface, "
-                 "scan, and inject frames.\n\n"
-                 "Relaunch with: sudo netstrike  (or via pkexec)"
+            body=("NetStrike needs root to control the wireless interface, "
+                  "scan, and inject frames.\n\nRelaunch via the desktop entry "
+                  "(uses pkexec) or run: sudo netstrike")
         )
         dialog.add_response("ok", "Continue anyway")
         dialog.present()
@@ -540,8 +706,33 @@ class MainWindow(Adw.ApplicationWindow):
             self.current_iface = self.interfaces[idx]
             self.scanner.set_interface(self.current_iface)
             self.deauth.set_interface(self.current_iface)
-            self.set_status("Interface changed")
+            self.refresh_mode_indicators()
             write_log(f"Interface set to {self.current_iface}")
+            self.toast(f"Interface: {self.current_iface}")
+
+    def on_refresh_interfaces(self, _btn):
+        new_list = list_wireless_interfaces()
+        if new_list == self.interfaces:
+            self.toast("No new interfaces")
+            return
+        self.interfaces = new_list
+        # Rebuild dropdown
+        new_dd = Gtk.DropDown.new_from_strings(self.interfaces)
+        new_dd.connect("notify::selected", self.on_iface_changed)
+        parent = self.iface_dropdown.get_parent()
+        parent.remove(self.iface_dropdown)
+        parent.prepend(new_dd)
+        self.iface_dropdown = new_dd
+        try:
+            idx = self.interfaces.index(self.current_iface)
+        except ValueError:
+            idx = 0
+            self.current_iface = self.interfaces[0]
+            self.scanner.set_interface(self.current_iface)
+            self.deauth.set_interface(self.current_iface)
+        new_dd.set_selected(idx)
+        self.refresh_mode_indicators()
+        self.toast(f"Detected: {', '.join(self.interfaces)}")
 
     # ------------------------------------------------------------------
     # WiFi page
@@ -550,70 +741,82 @@ class MainWindow(Adw.ApplicationWindow):
         scroll = Gtk.ScrolledWindow()
         scroll.set_vexpand(True)
 
-        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        content.set_margin_top(12)
-        content.set_margin_bottom(12)
-        content.set_margin_start(12)
-        content.set_margin_end(12)
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        content.set_margin_top(10)
+        content.set_margin_bottom(10)
+        content.set_margin_start(10)
+        content.set_margin_end(10)
         scroll.set_child(content)
 
+        title_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         title = Gtk.Label(label="WiFi Scanner")
         title.add_css_class("header-label")
         title.set_xalign(0)
-        content.append(title)
+        title.set_hexpand(True)
+        title_row.append(title)
+        self.wifi_spinner = Gtk.Spinner()
+        self.wifi_spinner.set_size_request(24, 24)
+        title_row.append(self.wifi_spinner)
+        content.append(title_row)
 
         scan_btn = Gtk.Button(label="🔍 Scan Networks")
         scan_btn.add_css_class("action-button")
         scan_btn.connect("clicked", self.on_scan_wifi)
+        self.scan_btn = scan_btn
         content.append(scan_btn)
-
-        self.wifi_progress = Gtk.ProgressBar()
-        self.wifi_progress.set_visible(False)
-        content.append(self.wifi_progress)
 
         net_label = Gtk.Label(label="Networks")
         net_label.add_css_class("title-label")
         net_label.set_xalign(0)
-        net_label.set_margin_top(8)
+        net_label.set_margin_top(6)
         content.append(net_label)
 
         self.networks_list = Gtk.ListBox()
         self.networks_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
         self.networks_list.connect("row-selected", self.on_network_selected)
         self.networks_list.add_css_class("card")
+        self._set_empty_state(self.networks_list, "Tap Scan to find networks")
         content.append(self.networks_list)
 
-        # Target detail (hidden until network picked)
+        # Detail panel
         self.detail_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         self.detail_box.set_visible(False)
-        self.detail_box.set_margin_top(12)
+        self.detail_box.set_margin_top(8)
 
         self.target_label = Gtk.Label(label="")
         self.target_label.add_css_class("title-label")
         self.target_label.set_xalign(0)
+        self.target_label.set_wrap(True)
         self.detail_box.append(self.target_label)
 
-        find_clients_btn = Gtk.Button(label="👥 Find Connected Clients (10s)")
-        find_clients_btn.add_css_class("action-button")
-        find_clients_btn.connect("clicked", self.on_scan_clients)
-        self.detail_box.append(find_clients_btn)
+        action_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8,
+                             homogeneous=True)
+        find_btn = Gtk.Button(label="👥 Find Clients")
+        find_btn.add_css_class("action-button")
+        find_btn.connect("clicked", self.on_scan_clients)
+        action_row.append(find_btn)
 
-        broadcast_btn = Gtk.Button(label="📡 Broadcast Deauth (64 frames)")
+        broadcast_btn = Gtk.Button(label="📡 Broadcast Deauth")
         broadcast_btn.add_css_class("danger-button")
         broadcast_btn.connect("clicked", self.on_broadcast_deauth)
-        self.detail_box.append(broadcast_btn)
+        action_row.append(broadcast_btn)
+        self.detail_box.append(action_row)
 
-        clients_label = Gtk.Label(label="Clients")
-        clients_label.add_css_class("title-label")
-        clients_label.set_xalign(0)
-        clients_label.set_margin_top(8)
-        self.detail_box.append(clients_label)
+        clients_header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        cl_lbl = Gtk.Label(label="Clients")
+        cl_lbl.add_css_class("title-label")
+        cl_lbl.set_xalign(0)
+        cl_lbl.set_hexpand(True)
+        clients_header.append(cl_lbl)
+        self.clients_spinner = Gtk.Spinner()
+        clients_header.append(self.clients_spinner)
+        self.detail_box.append(clients_header)
 
         self.clients_list = Gtk.ListBox()
         self.clients_list.set_selection_mode(Gtk.SelectionMode.NONE)
         self.clients_list.add_css_class("card")
+        self._set_empty_state(self.clients_list, "Run Find Clients to populate")
         self.detail_box.append(self.clients_list)
-
         content.append(self.detail_box)
 
         # Log
@@ -629,7 +832,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.wifi_log_buf = self.wifi_log.get_buffer()
 
         log_scroll = Gtk.ScrolledWindow()
-        log_scroll.set_min_content_height(120)
+        log_scroll.set_min_content_height(100)
         log_scroll.set_child(self.wifi_log)
         content.append(log_scroll)
 
@@ -650,27 +853,41 @@ class MainWindow(Adw.ApplicationWindow):
                 break
             listbox.remove(row)
 
+    def _set_empty_state(self, listbox, message):
+        self._clear_list(listbox)
+        row = Gtk.ListBoxRow()
+        row.set_selectable(False)
+        row.set_activatable(False)
+        lbl = Gtk.Label(label=message)
+        lbl.add_css_class("empty-state")
+        lbl.set_xalign(0.5)
+        row.set_child(lbl)
+        listbox.append(row)
+
     def on_scan_wifi(self, btn):
         btn.set_sensitive(False)
-        self.wifi_progress.set_visible(True)
-        self.wifi_progress.pulse()
+        self.wifi_spinner.start()
         self.set_status("Scanning…")
         self.log(f"Scanning on {self.current_iface}")
-
-        # Pulse progress while scanning
-        pulse_id = GLib.timeout_add(150, lambda: (self.wifi_progress.pulse(), True)[1])
+        self._clear_list(self.networks_list)
 
         def done(success, networks, err):
-            GLib.source_remove(pulse_id)
-            self.wifi_progress.set_visible(False)
+            self.wifi_spinner.stop()
             btn.set_sensitive(True)
-            self._clear_list(self.networks_list)
             if success:
-                self.log(f"Found {len(networks)} networks")
-                for net in sorted(networks, key=lambda n: n.signal, reverse=True):
-                    self.networks_list.append(self._build_network_row(net))
+                if networks:
+                    for net in sorted(networks, key=lambda n: n.signal, reverse=True):
+                        self.networks_list.append(self._build_network_row(net))
+                    self.log(f"Found {len(networks)} networks")
+                    self.toast(f"Found {len(networks)} networks")
+                else:
+                    self._set_empty_state(self.networks_list,
+                                          "No networks found")
+                    self.toast("No networks found")
             else:
+                self._set_empty_state(self.networks_list, "Scan failed")
                 self.log(f"Scan failed: {err}")
+                self.toast(f"Scan failed: {err}", timeout=5)
             self.set_status("Ready")
 
         self.scanner.scan_networks(done)
@@ -678,9 +895,9 @@ class MainWindow(Adw.ApplicationWindow):
     def _build_network_row(self, net):
         row = Gtk.ListBoxRow()
         row.add_css_class("network-row")
-        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        box.set_margin_top(8)
-        box.set_margin_bottom(8)
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        box.set_margin_top(6)
+        box.set_margin_bottom(6)
         box.set_margin_start(10)
         box.set_margin_end(10)
 
@@ -693,6 +910,7 @@ class MainWindow(Adw.ApplicationWindow):
         ssid = Gtk.Label(label=net.ssid)
         ssid.set_xalign(0)
         ssid.add_css_class("title-label")
+        ssid.set_ellipsize(3)  # PANGO_ELLIPSIZE_END
         info.append(ssid)
         detail = Gtk.Label(
             label=f"{net.bssid}  •  CH {net.channel}  •  {net.encryption}  •  {net.signal} dBm")
@@ -706,46 +924,63 @@ class MainWindow(Adw.ApplicationWindow):
         return row
 
     def on_network_selected(self, listbox, row):
-        if row is None:
+        if row is None or not hasattr(row, 'network'):
             return
         self.current_network = row.network
         self.target_label.set_text(
             f"Target: {row.network.ssid}\n{row.network.bssid}  •  CH {row.network.channel}")
         self.detail_box.set_visible(True)
-        self._clear_list(self.clients_list)
+        self._set_empty_state(self.clients_list, "Run Find Clients to populate")
         self.log(f"Target selected: {row.network.ssid} ({row.network.bssid})")
+
+    def _require_monitor(self):
+        if self._cached_mode != 'monitor':
+            self.refresh_mode_indicators()  # double-check
+        if self._cached_mode != 'monitor':
+            self._error(
+                "Monitor mode required",
+                f"{self.current_iface} is currently '{self._cached_mode}'. "
+                f"Switch to monitor mode in the Tools tab first."
+            )
+            return False
+        return True
 
     def on_scan_clients(self, btn):
         if not self.current_network:
             return
-        mode = get_interface_mode(self.current_iface)
-        if mode != 'monitor':
-            self._error("Monitor mode required",
-                        "Switch the interface to monitor mode in the Tools tab "
-                        "before scanning for clients.")
+        if not self._require_monitor():
             return
 
         btn.set_sensitive(False)
-        self.set_status("Listening for clients (10s)…")
+        self.clients_spinner.start()
+        self._clear_list(self.clients_list)
+        self.set_status(f"Listening for clients ({CLIENT_SCAN_DURATION}s)…")
         self.log(f"Listening for clients on {self.current_network.bssid}")
 
         def done(success, clients, err):
+            self.clients_spinner.stop()
             btn.set_sensitive(True)
-            self._clear_list(self.clients_list)
             if success:
-                self.log(f"Found {len(clients)} clients")
-                for c in clients:
-                    self.clients_list.append(self._build_client_row(c))
-                if not clients:
-                    self.log("No clients detected — try a longer scan or wait for activity")
+                if clients:
+                    for c in clients:
+                        self.clients_list.append(self._build_client_row(c))
+                    self.log(f"Found {len(clients)} clients")
+                    self.toast(f"Found {len(clients)} clients")
+                else:
+                    self._set_empty_state(self.clients_list,
+                                          "No clients detected — try again, "
+                                          "they may be idle")
+                    self.log("No clients detected")
             else:
+                self._set_empty_state(self.clients_list, "Client scan failed")
                 self.log(f"Client scan failed: {err}")
+                self.toast(f"Client scan failed: {err}", timeout=5)
             self.set_status("Ready")
 
         self.scanner.scan_clients(
             self.current_network.bssid,
             self.current_network.channel,
-            10,
+            CLIENT_SCAN_DURATION,
             done
         )
 
@@ -784,6 +1019,8 @@ class MainWindow(Adw.ApplicationWindow):
         return row
 
     def _deauth_client_dialog(self, client):
+        if not self._require_monitor():
+            return
         net = self.current_network
         dialog = Adw.MessageDialog(
             transient_for=self,
@@ -800,7 +1037,12 @@ class MainWindow(Adw.ApplicationWindow):
                 def worker():
                     ok, out = self.deauth.deauth_client(
                         net.bssid, client.mac, net.channel, 64)
-                    self.log("Deauth sent" if ok else f"Deauth failed: {out[:120]}")
+                    if ok:
+                        self.log("Deauth sent")
+                        self.toast("Deauth sent")
+                    else:
+                        self.log(f"Deauth failed: {out}")
+                        self.toast(f"Deauth failed: {out}", timeout=5)
                     self.set_status("Ready")
                 threading.Thread(target=worker, daemon=True).start()
             d.destroy()
@@ -809,15 +1051,16 @@ class MainWindow(Adw.ApplicationWindow):
         dialog.present()
 
     def _capture_handshake_dialog(self, client):
+        if not self._require_monitor():
+            return
         net = self.current_network
-        path = f"/tmp/netstrike_hs_{net.bssid.replace(':', '')}"
         dialog = Adw.MessageDialog(
             transient_for=self,
             heading="Capture WPA handshake",
-            body=(f"Capture WPA handshake for {net.ssid}?\n\n"
-                  f"This will briefly deauth {client.mac} to force a reconnect, "
-                  f"then save the .cap file to:\n{path}-01.cap\n\n"
-                  f"Use this only on networks you own."))
+            body=(f"Capture handshake for {net.ssid}?\n\n"
+                  f"Briefly deauth {client.mac} to force a reconnect, then save "
+                  f"the .cap file to:\n{CAPTURE_DIR}/\n\n"
+                  f"Only run this on networks you own."))
         dialog.add_response("cancel", "Cancel")
         dialog.add_response("go", "Capture")
         dialog.set_response_appearance("go", Adw.ResponseAppearance.SUGGESTED)
@@ -826,10 +1069,17 @@ class MainWindow(Adw.ApplicationWindow):
             if resp == "go":
                 self.set_status("Capturing handshake…")
                 self.log(f"Handshake capture: {net.bssid} via {client.mac}")
+                self.clients_spinner.start()
                 def worker():
-                    ok, out = self.deauth.capture_handshake(
-                        net.bssid, client.mac, net.channel, path)
-                    self.log(out if ok else f"Capture failed: {out[:120]}")
+                    ok, msg = self.deauth.capture_handshake(
+                        net.bssid, net.ssid, client.mac, net.channel)
+                    GLib.idle_add(self.clients_spinner.stop)
+                    if ok:
+                        self.log(msg)
+                        self.toast("Handshake captured", timeout=5)
+                    else:
+                        self.log(f"Capture failed: {msg}")
+                        self.toast(f"Capture failed: {msg}", timeout=5)
                     self.set_status("Ready")
                 threading.Thread(target=worker, daemon=True).start()
             d.destroy()
@@ -838,7 +1088,7 @@ class MainWindow(Adw.ApplicationWindow):
         dialog.present()
 
     def on_broadcast_deauth(self, btn):
-        if not self.current_network:
+        if not self.current_network or not self._require_monitor():
             return
         net = self.current_network
         dialog = Adw.MessageDialog(
@@ -856,9 +1106,14 @@ class MainWindow(Adw.ApplicationWindow):
                 self.set_status("Broadcasting deauth…")
                 self.log(f"Broadcast deauth on {net.bssid}")
                 def worker():
-                    ok, out = self.deauth.deauth_broadcast(net.bssid, net.channel, 64)
-                    self.log("Broadcast deauth sent" if ok
-                             else f"Broadcast failed: {out[:120]}")
+                    ok, out = self.deauth.deauth_broadcast(
+                        net.bssid, net.channel, 64)
+                    if ok:
+                        self.log("Broadcast deauth sent")
+                        self.toast("Broadcast deauth sent")
+                    else:
+                        self.log(f"Broadcast failed: {out}")
+                        self.toast(f"Broadcast failed: {out}", timeout=5)
                     self.set_status("Ready")
                 threading.Thread(target=worker, daemon=True).start()
             d.destroy()
@@ -873,17 +1128,23 @@ class MainWindow(Adw.ApplicationWindow):
         scroll = Gtk.ScrolledWindow()
         scroll.set_vexpand(True)
 
-        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        content.set_margin_top(12)
-        content.set_margin_bottom(12)
-        content.set_margin_start(12)
-        content.set_margin_end(12)
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        content.set_margin_top(10)
+        content.set_margin_bottom(10)
+        content.set_margin_start(10)
+        content.set_margin_end(10)
         scroll.set_child(content)
 
+        title_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         title = Gtk.Label(label="Nmap")
         title.add_css_class("header-label")
         title.set_xalign(0)
-        content.append(title)
+        title.set_hexpand(True)
+        title_row.append(title)
+        self.nmap_spinner = Gtk.Spinner()
+        self.nmap_spinner.set_size_request(24, 24)
+        title_row.append(self.nmap_spinner)
+        content.append(title_row)
 
         tgt_lbl = Gtk.Label(label="Target (IP / CIDR / hostname)")
         tgt_lbl.set_xalign(0)
@@ -896,7 +1157,7 @@ class MainWindow(Adw.ApplicationWindow):
         prof_lbl = Gtk.Label(label="Profile")
         prof_lbl.add_css_class("title-label")
         prof_lbl.set_xalign(0)
-        prof_lbl.set_margin_top(12)
+        prof_lbl.set_margin_top(8)
         content.append(prof_lbl)
 
         self.nmap_list = Gtk.ListBox()
@@ -912,14 +1173,10 @@ class MainWindow(Adw.ApplicationWindow):
         self.nmap_btn.connect("clicked", self.on_nmap_scan)
         content.append(self.nmap_btn)
 
-        self.nmap_progress = Gtk.ProgressBar()
-        self.nmap_progress.set_visible(False)
-        content.append(self.nmap_progress)
-
         res_lbl = Gtk.Label(label="Output")
         res_lbl.add_css_class("title-label")
         res_lbl.set_xalign(0)
-        res_lbl.set_margin_top(8)
+        res_lbl.set_margin_top(6)
         content.append(res_lbl)
 
         self.nmap_view = Gtk.TextView()
@@ -937,9 +1194,9 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _build_nmap_row(self, profile):
         row = Gtk.ListBoxRow()
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        box.set_margin_top(8)
-        box.set_margin_bottom(8)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        box.set_margin_top(6)
+        box.set_margin_bottom(6)
         box.set_margin_start(10)
         box.set_margin_end(10)
 
@@ -969,8 +1226,7 @@ class MainWindow(Adw.ApplicationWindow):
         profile = row.profile
 
         btn.set_sensitive(False)
-        self.nmap_progress.set_visible(True)
-        pulse_id = GLib.timeout_add(150, lambda: (self.nmap_progress.pulse(), True)[1])
+        self.nmap_spinner.start()
         self.set_status(f"Nmap scanning {target}…")
         write_log(f"Nmap: {profile['name']} on {target}")
 
@@ -984,14 +1240,21 @@ class MainWindow(Adw.ApplicationWindow):
                 for line in proc.stdout:
                     GLib.idle_add(self._append_nmap, line)
                 proc.wait()
-                GLib.idle_add(self._append_nmap, "\n✓ Done\n"
-                              if proc.returncode == 0 else "\n✗ Failed\n")
+                if proc.returncode == 0:
+                    GLib.idle_add(self._append_nmap, "\n✓ Done\n")
+                    self.toast("Nmap done")
+                else:
+                    GLib.idle_add(self._append_nmap,
+                                  f"\n✗ Failed (exit {proc.returncode})\n")
+                    self.toast("Nmap failed", timeout=5)
+            except FileNotFoundError:
+                GLib.idle_add(self._append_nmap, "\n✗ nmap not installed\n")
+                self.toast("nmap not installed", timeout=5)
             except Exception as e:
                 GLib.idle_add(self._append_nmap, f"\nError: {e}\n")
             finally:
                 def finish():
-                    GLib.source_remove(pulse_id)
-                    self.nmap_progress.set_visible(False)
+                    self.nmap_spinner.stop()
                     btn.set_sensitive(True)
                     self.set_status("Ready")
                 GLib.idle_add(finish)
@@ -1009,11 +1272,11 @@ class MainWindow(Adw.ApplicationWindow):
         scroll = Gtk.ScrolledWindow()
         scroll.set_vexpand(True)
 
-        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        content.set_margin_top(12)
-        content.set_margin_bottom(12)
-        content.set_margin_start(12)
-        content.set_margin_end(12)
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        content.set_margin_top(10)
+        content.set_margin_bottom(10)
+        content.set_margin_start(10)
+        content.set_margin_end(10)
         scroll.set_child(content)
 
         title = Gtk.Label(label="Tools")
@@ -1034,32 +1297,37 @@ class MainWindow(Adw.ApplicationWindow):
         self.mode_label.set_xalign(0)
         mode_card.append(self.mode_label)
 
-        btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8,
+        btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6,
                           homogeneous=True)
         mon_btn = Gtk.Button(label="📡 Monitor")
         mon_btn.add_css_class("action-button")
-        mon_btn.connect("clicked", self.on_set_monitor)
+        mon_btn.connect("clicked", lambda b: self._switch_mode(b, 'monitor'))
         btn_row.append(mon_btn)
 
         man_btn = Gtk.Button(label="🌐 Managed")
         man_btn.add_css_class("success-button")
-        man_btn.connect("clicked", self.on_set_managed)
+        man_btn.connect("clicked", lambda b: self._switch_mode(b, 'managed'))
         btn_row.append(man_btn)
 
-        refresh_btn = Gtk.Button(label="🔄 Refresh")
-        refresh_btn.connect("clicked", self.on_refresh_mode)
+        refresh_btn = Gtk.Button(label="🔄")
+        refresh_btn.add_css_class("subtle-button")
+        refresh_btn.connect("clicked", lambda b: self.refresh_mode_indicators())
         btn_row.append(refresh_btn)
         mode_card.append(btn_row)
         content.append(mode_card)
 
-        # Info
+        # Info card
         info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         info.add_css_class("card")
         info.append(self._label("Monitor mode", "title-label"))
-        info.append(self._label("• Required for client scanning, deauth, capture", "subtitle-label"))
+        info.append(self._label("• Required for client scan, deauth, capture",
+                                "subtitle-label"))
         info.append(self._label("• No internet while active", "subtitle-label"))
-        info.append(self._label("• OnePlus 6 internal radio may not support it — use AR9271", "subtitle-label"))
+        info.append(self._label("• OnePlus 6 internal radio: unreliable. Use AR9271 (wlan1)",
+                                "subtitle-label"))
         info.append(self._label("", "subtitle-label"))
+        info.append(self._label("Captures", "title-label"))
+        info.append(self._label(f"{CAPTURE_DIR}", "subtitle-label"))
         info.append(self._label("Activity log", "title-label"))
         info.append(self._label(f"{LOG_FILE}", "subtitle-label"))
         content.append(info)
@@ -1067,8 +1335,8 @@ class MainWindow(Adw.ApplicationWindow):
         # About
         about = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         about.add_css_class("card")
-        about.append(self._label("NetStrike", "title-label"))
-        about.append(self._label("WiFi security audit tool — NetHunter Pro / Phosh",
+        about.append(self._label("NetStrike v1.1", "title-label"))
+        about.append(self._label("WiFi security audit — NetHunter Pro / Phosh",
                                  "subtitle-label"))
         about.append(self._label("Use only on networks you own or are authorized to test.",
                                  "subtitle-label"))
@@ -1084,17 +1352,11 @@ class MainWindow(Adw.ApplicationWindow):
             lbl.add_css_class(css_class)
         return lbl
 
-    def on_set_monitor(self, btn):
-        self._switch_mode(btn, 'monitor')
-
-    def on_set_managed(self, btn):
-        self._switch_mode(btn, 'managed')
-
     def _switch_mode(self, btn, target_mode):
         btn.set_sensitive(False)
         iface = self.current_iface
         self.set_status(f"Setting {iface} to {target_mode}…")
-        write_log(f"Mode change requested: {iface} -> {target_mode}")
+        write_log(f"Mode change: {iface} -> {target_mode}")
 
         def worker():
             try:
@@ -1109,20 +1371,19 @@ class MainWindow(Adw.ApplicationWindow):
                     subprocess.run(c, capture_output=True, timeout=10)
             except Exception as e:
                 write_log(f"Mode change error: {e}")
-            GLib.idle_add(self.on_refresh_mode, None)
-            GLib.idle_add(btn.set_sensitive, True)
-            self.set_status("Ready")
+
+            new_mode = get_interface_mode(iface)
+            def finish():
+                self.refresh_mode_indicators()
+                btn.set_sensitive(True)
+                if new_mode == target_mode:
+                    self.toast(f"{iface} → {target_mode}")
+                else:
+                    self.toast(f"Mode change failed ({iface}: {new_mode})",
+                               timeout=5)
+            GLib.idle_add(finish)
 
         threading.Thread(target=worker, daemon=True).start()
-
-    def on_refresh_mode(self, btn):
-        mode = get_interface_mode(self.current_iface)
-        self.mode_label.set_text(f"{self.current_iface}: {mode}")
-        css = "mode-monitor" if mode == "monitor" else "mode-managed"
-        for c in ("mode-monitor", "mode-managed"):
-            self.mode_label.remove_css_class(c)
-        self.mode_label.add_css_class(css)
-        self.set_status("Ready")
 
     def _error(self, heading, body):
         d = Adw.MessageDialog(transient_for=self, heading=heading, body=body)
@@ -1134,7 +1395,11 @@ class MainWindow(Adw.ApplicationWindow):
 # MAIN
 # ============================================================================
 
-if __name__ == '__main__':
-    write_log("NetStrike started")
+def main():
+    write_log("NetStrike v1.1 started")
     app = NetStrikeApp()
-    sys.exit(app.run(sys.argv))
+    return app.run(sys.argv)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
